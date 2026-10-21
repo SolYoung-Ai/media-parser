@@ -1,12 +1,12 @@
 """
 本地语音识别（Whisper）端点（ClipText 专用补丁）
-零外部 API Key、零费用：本机 faster-whisper 推理。
+零外部 API Key、零费用：faster-whisper 推理。
 
 两个端点：
 1. POST /v1/audio/transcriptions   OpenAI 兼容（multipart file 上传），返回 {"text": "..."}
 2. POST /api/v1/asr-from-url        直接对解析结果里的视频 URL 转写，返回 text + segments
 
-模型选择：环境变量 ASR_MODEL（默认 base）；首次使用自动从 HuggingFace 下载。
+模型选择：环境变量 ASR_MODEL（默认 tiny，省内存适合免费层）；首次使用自动从 HuggingFace 下载。
 SSRF 防护：复用 media_proxy 的域名白名单（只允许平台媒体 CDN）。
 """
 import os
@@ -15,7 +15,6 @@ import tempfile
 import requests
 from flask import Blueprint, abort, jsonify, request
 
-# ---- PyAV 兼容补丁：av 19 移除了 metadata_errors 参数，faster-whisper 1.2.1 仍传入，直接忽略 ----
 try:
     import av as _av
     import av.container.core as _avcore
@@ -33,7 +32,7 @@ except Exception:
 
 asr_bp = Blueprint('asr', __name__)
 
-_MODEL_NAME = os.getenv('ASR_MODEL', 'base')
+_MODEL_NAME = os.getenv('ASR_MODEL', 'tiny')
 _MODEL = None
 
 
@@ -41,7 +40,6 @@ def _get_model():
     global _MODEL
     if _MODEL is None:
         from faster_whisper import WhisperModel
-        # M4/CPU：int8 量化即可，速度与精度平衡
         _MODEL = WhisperModel(_MODEL_NAME, device='cpu', compute_type='int8')
     return _MODEL
 
@@ -65,7 +63,6 @@ def _whisper_transcribe(audio_path):
 
 @asr_bp.route('/v1/audio/transcriptions', methods=['POST'])
 def openai_transcriptions():
-    """OpenAI 兼容：接收 multipart file，返回 {"text": "..."}。"""
     f = request.files.get('file')
     if f is None:
         abort(400, description='缺少 file 字段')
@@ -93,7 +90,6 @@ def openai_models():
 
 @asr_bp.route('/api/v1/asr-from-url', methods=['POST', 'GET'])
 def asr_from_url():
-    """对刚解析出来的视频 URL 直接转写，免去用户手动下载再上传。"""
     from media_proxy import _host_allowed, _is_public_ip
     import socket as _socket
     from urllib.parse import urlparse
