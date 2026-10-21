@@ -1,0 +1,26 @@
+# Render Blueprint：media-parser（ClipText 后端）
+# 在 Render 中导入本仓库，选择「Blueprint」即可一键部署。
+# 免费实例限制：750 小时/月，闲置 15 分钟后休眠（首次请求需约 1 分钟冷启动）。
+# 建议生产环境开启认证：设置 API_ONLY=true 后可配合 CORS_ALLOW_ORIGINS 限制来源。
+
+services:
+  - type: web
+    name: media-parser
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -b 0.0.0.0:$PORT --timeout 120 server:app
+    envVars:
+      - key: API_ONLY
+        value: "true"
+      - key: TRUST_PROXY_HEADERS
+        value: "true"
+      - key: CORS_ALLOW_ORIGINS
+        value: "*"
+      - key: PYTHONUNBUFFERED
+        value: "1"
+    disk:
+      name: media-parser-data
+      mountPath: /opt/render/project/src/data
+      sizeGB: 1
+healthCheckPath: /api/health
