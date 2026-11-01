@@ -33,7 +33,10 @@ except Exception:
 asr_bp = Blueprint('asr', __name__)
 
 _MODEL_NAME = os.getenv('ASR_MODEL', 'tiny')
-_MODEL = None
+_MODELS = {}
+
+# 免费实例只有 512MB 内存，允许切换的模型上限到 base（int8 约 150MB）；small 以上会 OOM
+_ALLOWED_MODELS = {'tiny', 'base'}
 
 # 免费实例 CPU 很弱，用贪心解码（beam=1）与多线程把小模型的推理时间压到最低；
 # 质量优先时可把 ASR_BEAM_SIZE 调到 5。
@@ -45,23 +48,42 @@ _INITIAL_PROMPT = os.getenv('ASR_INITIAL_PROMPT', '以下是普通话的句子�
 
 _MAX_BYTES = 100 * 1024 * 1024
 
+_CC = None
 
-def _get_model():
-    global _MODEL
-    if _MODEL is None:
+
+def _to_simplified(text):
+    """initial_prompt 只能部分抑制繁体输出，最后统一做一遍繁转简兜底。"""
+    if not text or os.getenv('ASR_SIMPLIFY', '1') != '1':
+        return text
+    global _CC
+    try:
+        if _CC is None:
+            from opencc import OpenCC
+            _CC = OpenCC('t2s')
+        return _CC.convert(text)
+    except Exception as exc:  # 转换失败不影响主流程
+        print(f'opencc convert failed: {exc}')
+        return text
+
+
+def _get_model(name=None):
+    key = (name or '').strip().lower()
+    if key not in _ALLOWED_MODELS:
+        key = _MODEL_NAME
+    if key not in _MODELS:
         from faster_whisper import WhisperModel
-        _MODEL = WhisperModel(
-            _MODEL_NAME,
+        _MODELS[key] = WhisperModel(
+            key,
             device='cpu',
             compute_type='int8',
             cpu_threads=_CPU_THREADS,
             num_workers=1,
         )
-    return _MODEL
+    return _MODELS[key]
 
 
-def _whisper_transcribe(audio_path):
-    model = _get_model()
+def _whisper_transcribe(audio_path, model_name=None):
+    model = _get_model(model_name)
     segments, info = model.transcribe(
         audio_path,
         language=os.getenv('ASR_LANGUAGE', 'zh'),
@@ -76,9 +98,10 @@ def _whisper_transcribe(audio_path):
     seg_list = []
     text_parts = []
     for seg in segments:
-        seg_list.append({'start': round(seg.start, 2), 'end': round(seg.end, 2), 'text': seg.text.strip()})
-        text_parts.append(seg.text.strip())
-    return {'text': ''.join(text_parts), 'segments': seg_list, 'language': info.language}
+        seg_text = _to_simplified(seg.text.strip())
+        seg_list.append({'start': round(seg.start, 2), 'end': round(seg.end, 2), 'text': seg_text})
+        text_parts.append(seg_text)
+    return {'text': _to_simplified(''.join(text_parts)), 'segments': seg_list, 'language': info.language}
 
 
 @asr_bp.route('/v1/audio/transcriptions', methods=['POST'])
@@ -87,12 +110,13 @@ def openai_transcriptions():
     if f is None:
         abort(400, description='缺少 file 字段')
     suffix = os.path.splitext(f.filename or 'audio.mp4')[1] or '.mp4'
+    model_name = (request.form.get('model') or '').strip()
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     try:
         f.save(tmp)
         tmp.close()
         try:
-            result = _whisper_transcribe(tmp.name)
+            result = _whisper_transcribe(tmp.name, model_name)
         except Exception as exc:
             print(f'ASR transcription failed: {exc.__class__.__name__}: {exc}')
             abort(500, description='转写失败：' + str(exc))
@@ -113,8 +137,14 @@ def openai_models():
 def asr_warmup():
     """预加载模型，避免首次转写把模型加载耗时算进识别请求里。"""
     try:
-        _get_model()
-        return jsonify({'status': 'ok', 'model': _MODEL_NAME, 'beam': _BEAM_SIZE, 'threads': _CPU_THREADS})
+        _get_model(request.args.get('model'))
+        return jsonify({
+            'status': 'ok',
+            'model': _MODEL_NAME,
+            'allowed': sorted(_ALLOWED_MODELS),
+            'beam': _BEAM_SIZE,
+            'threads': _CPU_THREADS,
+        })
     except Exception as exc:
         abort(500, description='模型加载失败：' + str(exc))
 
@@ -125,11 +155,14 @@ def asr_from_url():
     import socket as _socket
     from urllib.parse import urlparse
 
+    model_name = ''
     if request.method == 'POST' and request.is_json:
         data = request.get_json(silent=True) or {}
         url = (data.get('url') or '').strip()
+        model_name = (data.get('model') or '').strip()
     else:
         url = (request.args.get('url') or '').strip()
+        model_name = (request.args.get('model') or '').strip()
     if not url:
         abort(400, description='缺少 url 参数')
     parsed = urlparse(url)
@@ -184,7 +217,7 @@ def asr_from_url():
             abort(502, description='下载视频失败: 媒体内容为空')
 
         try:
-            result = _whisper_transcribe(tmp.name)
+            result = _whisper_transcribe(tmp.name, model_name)
         except Exception as exc:
             print(f'ASR transcribe failed: {exc.__class__.__name__}: {exc}')
             abort(500, description='转写失败：' + str(exc))
