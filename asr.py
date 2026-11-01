@@ -35,6 +35,14 @@ asr_bp = Blueprint('asr', __name__)
 _MODEL_NAME = os.getenv('ASR_MODEL', 'tiny')
 _MODEL = None
 
+# 免费实例 CPU 很弱，用贪心解码（beam=1）与多线程把小模型的推理时间压到最低；
+# 质量优先时可把 ASR_BEAM_SIZE 调到 5。
+_CPU_THREADS = int(os.getenv('ASR_THREADS', '4'))
+_BEAM_SIZE = int(os.getenv('ASR_BEAM_SIZE', '1'))
+
+# Whisper 默认可能输出繁体，用 initial_prompt 引导为简体中文
+_INITIAL_PROMPT = os.getenv('ASR_INITIAL_PROMPT', '以下是普通话的句子，请使用简体中文。')
+
 _MAX_BYTES = 100 * 1024 * 1024
 
 
@@ -42,7 +50,13 @@ def _get_model():
     global _MODEL
     if _MODEL is None:
         from faster_whisper import WhisperModel
-        _MODEL = WhisperModel(_MODEL_NAME, device='cpu', compute_type='int8')
+        _MODEL = WhisperModel(
+            _MODEL_NAME,
+            device='cpu',
+            compute_type='int8',
+            cpu_threads=_CPU_THREADS,
+            num_workers=1,
+        )
     return _MODEL
 
 
@@ -51,9 +65,13 @@ def _whisper_transcribe(audio_path):
     segments, info = model.transcribe(
         audio_path,
         language=os.getenv('ASR_LANGUAGE', 'zh'),
-        beam_size=5,
+        beam_size=_BEAM_SIZE,
+        best_of=_BEAM_SIZE,
+        temperature=0,
+        condition_on_previous_text=False,
+        initial_prompt=_INITIAL_PROMPT,
         vad_filter=True,
-        vad_parameters=dict(min_silence_duration_ms=500),
+        vad_parameters=dict(min_silence_duration_ms=300),
     )
     seg_list = []
     text_parts = []
@@ -89,6 +107,16 @@ def openai_transcriptions():
 @asr_bp.route('/v1/models', methods=['GET'])
 def openai_models():
     return jsonify({'data': [{'id': _MODEL_NAME, 'object': 'model', 'owned_by': 'local-whisper'}], 'object': 'list'})
+
+
+@asr_bp.route('/api/v1/asr-warmup', methods=['GET', 'POST'])
+def asr_warmup():
+    """预加载模型，避免首次转写把模型加载耗时算进识别请求里。"""
+    try:
+        _get_model()
+        return jsonify({'status': 'ok', 'model': _MODEL_NAME, 'beam': _BEAM_SIZE, 'threads': _CPU_THREADS})
+    except Exception as exc:
+        abort(500, description='模型加载失败：' + str(exc))
 
 
 @asr_bp.route('/api/v1/asr-from-url', methods=['POST', 'GET'])
