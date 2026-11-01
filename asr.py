@@ -35,6 +35,8 @@ asr_bp = Blueprint('asr', __name__)
 _MODEL_NAME = os.getenv('ASR_MODEL', 'tiny')
 _MODEL = None
 
+_MAX_BYTES = 100 * 1024 * 1024
+
 
 def _get_model():
     global _MODEL
@@ -71,11 +73,12 @@ def openai_transcriptions():
     try:
         f.save(tmp)
         tmp.close()
-        result = _whisper_transcribe(tmp.name)
+        try:
+            result = _whisper_transcribe(tmp.name)
+        except Exception as exc:
+            print(f'ASR transcription failed: {exc.__class__.__name__}: {exc}')
+            abort(500, description='转写失败：' + str(exc))
         return jsonify({'text': result['text'], 'segments': result['segments']})
-    except Exception as exc:
-        print(f'ASR transcription failed: {exc.__class__.__name__}: {exc}')
-        abort(500, description='转写失败：' + str(exc))
     finally:
         try:
             os.unlink(tmp.name)
@@ -90,7 +93,7 @@ def openai_models():
 
 @asr_bp.route('/api/v1/asr-from-url', methods=['POST', 'GET'])
 def asr_from_url():
-    from media_proxy import _host_allowed, _is_public_ip
+    from media_proxy import _host_allowed, _is_public_ip, _guess_referer, _USER_AGENT
     import socket as _socket
     from urllib.parse import urlparse
 
@@ -118,24 +121,46 @@ def asr_from_url():
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
     try:
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-            'Referer': 'https://www.douyin.com/',
+            'User-Agent': _USER_AGENT,
+            # 关键修复：Referer 必须跟随媒体域名（小红书 CDN 只认 xiaohongshu.com，
+            # 视频号认 channels.weixin.qq.com）。此前硬编码抖音 Referer，
+            # 导致小红书 / 视频号的视频在服务端下载时一律 403。
+            'Referer': _guess_referer(host),
+            'Accept': '*/*',
         }
-        resp = requests.get(url, headers=headers, stream=True, timeout=(15, 60))
+        try:
+            resp = requests.get(url, headers=headers, stream=True,
+                                timeout=(15, 60), allow_redirects=True)
+        except requests.exceptions.Timeout:
+            abort(504, description='媒体源响应超时')
+        except requests.exceptions.RequestException as exc:
+            abort(502, description=f'下载视频失败: {exc.__class__.__name__}')
         if resp.status_code != 200:
-            abort(502, description=f'媒体源返回 HTTP {resp.status_code}')
-        max_bytes = 100 * 1024 * 1024
+            resp.close()
+            abort(502, description=f'下载视频失败: HTTP {resp.status_code}')
+
         wrote = 0
-        for chunk in resp.iter_content(chunk_size=64 * 1024):
-            wrote += len(chunk)
-            if wrote > max_bytes:
-                break
-            tmp.write(chunk)
-        tmp.close()
-        result = _whisper_transcribe(tmp.name)
+        try:
+            for chunk in resp.iter_content(chunk_size=64 * 1024):
+                if not chunk:
+                    continue
+                wrote += len(chunk)
+                if wrote > _MAX_BYTES:
+                    break
+                tmp.write(chunk)
+        finally:
+            resp.close()
+            tmp.close()
+
+        if wrote == 0:
+            abort(502, description='下载视频失败: 媒体内容为空')
+
+        try:
+            result = _whisper_transcribe(tmp.name)
+        except Exception as exc:
+            print(f'ASR transcribe failed: {exc.__class__.__name__}: {exc}')
+            abort(500, description='转写失败：' + str(exc))
         return jsonify(result)
-    except Exception as exc:
-        abort(500, description='转写失败：' + str(exc))
     finally:
         try:
             os.unlink(tmp.name)
